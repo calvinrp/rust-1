@@ -13,7 +13,7 @@ use rustc_hir::{PolyTraitRef, TyKind, WhereBoundPredicate};
 use rustc_infer::infer::{NllRegionVariableOrigin, SubregionOrigin};
 use rustc_middle::bug;
 use rustc_middle::hir::place::PlaceBase;
-use rustc_middle::mir::{AnnotationSource, ConstraintCategory, ReturnConstraint};
+use rustc_middle::mir::{AnnotationSource, CallArgumentKind, ConstraintCategory, ReturnConstraint};
 use rustc_middle::ty::{
     self, GenericArgs, Region, RegionVid, Ty, TyCtxt, TypeFoldable, TypeVisitor, fold_regions,
 };
@@ -28,9 +28,9 @@ use rustc_trait_selection::traits::{Obligation, ObligationCtxt};
 use tracing::{debug, instrument, trace};
 
 use super::{LIMITATION_NOTE, OutlivesSuggestionBuilder, RegionName, RegionNameSource};
-use crate::consumers::RegionInferenceContext;
+use crate::consumers::{OutlivesConstraint, RegionInferenceContext};
 use crate::nll::ConstraintDescription;
-use crate::region_infer::{BlameConstraint, TypeTest};
+use crate::region_infer::TypeTest;
 use crate::session_diagnostics::{
     FnMutError, FnMutReturnTypeErr, GenericDoesNotLiveLongEnough, LifetimeOutliveErr,
     LifetimeReturnCategoryErr, RequireStaticErr, VarHereDenote,
@@ -49,7 +49,11 @@ impl<'tcx> ConstraintDescription for ConstraintCategory<'tcx> {
             ConstraintCategory::UseAsStatic => "using this value as a static ",
             ConstraintCategory::Cast { is_implicit_coercion: false, .. } => "cast ",
             ConstraintCategory::Cast { is_implicit_coercion: true, .. } => "coercion ",
-            ConstraintCategory::CallArgument(_) => "argument ",
+            ConstraintCategory::CallArgument(_, kind) => match kind {
+                CallArgumentKind::Normal => "argument ",
+                CallArgumentKind::Receiver => "receiver ",
+                CallArgumentKind::Closure => "closure ",
+            },
             ConstraintCategory::TypeAnnotation(AnnotationSource::GenericArg) => "generic argument ",
             ConstraintCategory::TypeAnnotation(_) => "type annotation ",
             ConstraintCategory::SizedBound => "proving this value is `Sized` ",
@@ -414,9 +418,8 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         };
 
         // Find the code to blame for the fact that `longer_fr` outlives `error_fr`.
-        let (blame_constraint, path) =
-            self.regioncx.best_blame_constraint(longer_fr, origin_longer, error_vid);
-        let cause = blame_constraint.to_obligation_cause_from_path(&path);
+        let best_blame = self.regioncx.best_blame_constraint(longer_fr, origin_longer, error_vid);
+        let cause = best_blame.to_obligation_cause();
 
         // FIXME these methods should have better names, and also probably not be this generic.
         // FIXME note that we *throw away* the error element here! We probably want to
@@ -447,9 +450,9 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     ) {
         debug!("report_region_error(fr={:?}, outlived_fr={:?})", fr, outlived_fr);
 
-        let (blame_constraint, path) =
-            self.regioncx.best_blame_constraint(fr, fr_origin, outlived_fr);
-        let BlameConstraint { category, span, variance_info, .. } = blame_constraint;
+        let best_blame = self.regioncx.best_blame_constraint(fr, fr_origin, outlived_fr);
+        let OutlivesConstraint { category, span, variance_info, .. } = *best_blame.constraint();
+        let path = best_blame.path();
 
         debug!("report_region_error: category={:?} {:?} {:?}", category, span, variance_info);
 
@@ -492,7 +495,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 self.report_fnmut_error(&errci, kind)
             }
             (ConstraintCategory::Assignment, true, false)
-            | (ConstraintCategory::CallArgument(_), true, false) => {
+            | (ConstraintCategory::CallArgument(_, _), true, false) => {
                 let mut db = self.report_escaping_data_error(&errci);
 
                 outlives_suggestion.intermediate_suggestion(self, &errci, &mut db);
@@ -563,10 +566,10 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             }
         }
 
-        self.add_placeholder_from_predicate_note(&mut diag, &path);
-        self.add_sized_or_copy_bound_info(&mut diag, category, &path);
+        self.add_placeholder_from_predicate_note(&mut diag, path);
+        self.add_sized_or_copy_bound_info(&mut diag, category, path);
 
-        for constraint in &path {
+        for constraint in path {
             if let ConstraintCategory::Cast { is_raw_ptr_dyn_type_cast: true, .. } =
                 constraint.category
             {
@@ -946,7 +949,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
 
         let tcx = self.infcx.tcx;
 
-        let ConstraintCategory::CallArgument(Some(func_ty)) = category else { return };
+        let ConstraintCategory::CallArgument(Some(func_ty), _) = category else { return };
         let ty::FnDef(fn_did, args) = *func_ty.kind() else { return };
         debug!(?fn_did, ?args);
 
