@@ -139,7 +139,7 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
         &mut self,
         mut decl: Decl<'ra>,
         mut parent_id: ParentId<'ra>,
-        seen_max: &mut FxHashSet<Decl<'ra>>,
+        seen_most_visible: &mut FxHashSet<Decl<'ra>>,
     ) {
         let priv_vis = |this: &Self, parent_id, decl| match parent_id {
             ParentId::Def(_) => this.current_private_vis,
@@ -147,12 +147,12 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
         };
         while let DeclKind::Import { source_decl, .. } = decl.kind {
             self.update_import(decl, parent_id, priv_vis(self, parent_id, decl));
-            // `vis()` is the most visible glob, so that glob's chain must be
-            // marked too. `ambiguity_vis_max` can cycle; follow it once.
-            if let Some(max) = decl.ambiguity_vis_max.get()
-                && seen_max.insert(max)
+            // Same item, more public glob: `vis()` uses that, so mark its chain
+            // too. Mutual globs can cycle here; walk each most-visible glob once.
+            if let Some(most_visible) = decl.ambiguity_vis_max.get()
+                && seen_most_visible.insert(most_visible)
             {
-                self.update_decl_chain(max, parent_id, seen_max);
+                self.update_decl_chain(most_visible, parent_id, seen_most_visible);
             }
             parent_id = ParentId::Import(decl);
             decl = source_decl;
