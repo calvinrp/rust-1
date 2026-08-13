@@ -92,14 +92,10 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
         };
 
         visitor.def_effective_visibilities.update_root();
+        visitor.set_bindings_effective_visibilities(CRATE_DEF_ID);
 
         while visitor.changed {
             visitor.changed = false;
-            // The crate root walks in every iteration like any other module
-            // (`visit_item` re-walks nested modules): `update_decl_chain` visits
-            // each declaration at most once per walk, so anything it skips in
-            // one iteration must be re-attempted until nothing changes.
-            visitor.set_bindings_effective_visibilities(CRATE_DEF_ID);
             visit::walk_crate(&mut visitor, krate);
         }
         visitor.r.effective_visibilities = visitor.def_effective_visibilities;
@@ -142,7 +138,7 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
     /// sets the rest of the `use` chain to `Level::Reexported` until
     /// we hit the actual exported item.
     fn update_decl_chain(&mut self, decl: Decl<'ra>, parent_id: ParentId<'ra>) {
-        self.update_decl_chain_inner(decl, parent_id, &mut Default::default());
+        self.update_decl_chain_inner(decl, parent_id, &mut FxHashSet::default());
     }
 
     fn update_decl_chain_inner(
@@ -156,14 +152,6 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
             ParentId::Import(_) => this.r.private_vis_decl(decl),
         };
         while let DeclKind::Import { source_decl, .. } = decl.kind {
-            // Ambiguous glob imports can form cyclic reexport chains: following
-            // `ambiguity_vis_max` below may lead back to a declaration this walk
-            // has already updated. Visit each declaration at most once
-            // per walk — any update a skip leaves behind is picked up by the
-            // next `changed` iteration in `compute_effective_visibilities`.
-            if !visited.insert(decl) {
-                return;
-            }
             self.update_import(decl, parent_id, priv_vis(self, parent_id, decl));
             if let Some(max_vis_decl) = decl.ambiguity_vis_max.get() {
                 // The name is exported with the visibility of the most visible declaration
@@ -175,7 +163,13 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
                 // `ambiguous-import-visibility-globglob-mir.rs`).
                 // This also avoids the most visible import in an ambiguous glob set
                 // being reported as unused.
-                self.update_decl_chain_inner(max_vis_decl, parent_id, visited);
+                //
+                // `source_decl` is an older-to-newer DAG and cannot cycle.
+                // `ambiguity_vis_max` can point at a later glob whose `source_decl` is
+                // this decl (mutual globs of the same item). Take that edge once.
+                if visited.insert(max_vis_decl) {
+                    self.update_decl_chain_inner(max_vis_decl, parent_id, visited);
+                }
             }
             parent_id = ParentId::Import(decl);
             decl = source_decl;

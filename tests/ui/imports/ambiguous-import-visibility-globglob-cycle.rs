@@ -1,29 +1,32 @@
-// Regression test for #160685: ambiguous glob imports whose reexport chains
-// form a cycle (`axiomatic` and `own` glob-import each other, and the same
-// item also arrives through `orphan`) sent `update_decl_chain` into infinite
-// recursion through `ambiguity_vis_max`, overflowing the stack. Each
-// declaration is now visited at most once per chain walk; the effective
-// visibility fixpoint loop picks up anything a skipped revisit would have
-// contributed. Minimized from the `reflect_tools` crate by @theemathas.
+// issue: rust-lang/rust#160685
+// Ambiguous globs of the same item that also cycle through `ambiguity_vis_max`
+// (`axiomatic` and `own` glob-import each other; the item also arrives via `orphan`).
+// Minimized from the `reflect_tools` crate.
 
-//@ check-pass
-//@ edition: 2024
+#![feature(rustc_attrs)]
+#![allow(internal_features)]
+#![deny(dead_code)]
 
 pub mod axiomatic {
+    #[allow(unused_imports)]
     use super::*; // not pub
-    pub use own::*;
+    pub use self::own::*;
 
     pub mod own {
         pub use super::*;
-        pub use orphan::*;
+        pub use super::orphan::*;
     }
 
     pub mod orphan {
         pub use super::private::CollectionDescriptor;
     }
 
-    pub mod private {
-        pub struct CollectionDescriptor;
+    // Private so the only public path is the glob reexport, matching
+    // `ambiguous-import-visibility-globglob-reachable.rs`.
+    mod private {
+        #[rustc_effective_visibility]
+        pub struct CollectionDescriptor {}
+        //~^ ERROR Direct: pub(in crate::axiomatic), Reexported: pub, Reachable: pub, ReachableThroughImplTrait: pub
     }
 }
 
