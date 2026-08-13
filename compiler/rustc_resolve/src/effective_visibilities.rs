@@ -129,23 +129,17 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
             let Some(decl) = name_resolution.borrow(self.r).best_decl() else {
                 continue;
             };
-            self.update_decl_chain(decl, ParentId::Def(module_id));
+            self.update_decl_chain(decl, ParentId::Def(module_id), &mut FxHashSet::default());
         }
     }
 
-    /// Update effective visibilities for the whole reexport chain of a declaration.
-    /// Set the given effective visibility level to `Level::Direct` and
-    /// sets the rest of the `use` chain to `Level::Reexported` until
-    /// we hit the actual exported item.
-    fn update_decl_chain(&mut self, decl: Decl<'ra>, parent_id: ParentId<'ra>) {
-        self.update_decl_chain_inner(decl, parent_id, &mut FxHashSet::default());
-    }
-
-    fn update_decl_chain_inner(
+    /// Mark `decl` and its `use` chain as exported from `parent_id`.
+    /// First hop is `Level::Direct`; later hops are `Level::Reexported`.
+    fn update_decl_chain(
         &mut self,
         mut decl: Decl<'ra>,
         mut parent_id: ParentId<'ra>,
-        visited: &mut FxHashSet<Decl<'ra>>,
+        seen_max: &mut FxHashSet<Decl<'ra>>,
     ) {
         let priv_vis = |this: &Self, parent_id, decl| match parent_id {
             ParentId::Def(_) => this.current_private_vis,
@@ -153,23 +147,12 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
         };
         while let DeclKind::Import { source_decl, .. } = decl.kind {
             self.update_import(decl, parent_id, priv_vis(self, parent_id, decl));
-            if let Some(max_vis_decl) = decl.ambiguity_vis_max.get() {
-                // The name is exported with the visibility of the most visible declaration
-                // in its ambiguous glob set (see `DeclData::vis`), so everything on that
-                // declaration's reexport chain, including the final item, must get its
-                // effective visibility from that declaration as well. Otherwise the item
-                // would be considered unreachable by dead code analysis and metadata
-                // encoding despite being exported (see the regression test
-                // `ambiguous-import-visibility-globglob-mir.rs`).
-                // This also avoids the most visible import in an ambiguous glob set
-                // being reported as unused.
-                //
-                // `source_decl` is an older-to-newer DAG and cannot cycle.
-                // `ambiguity_vis_max` can point at a later glob whose `source_decl` is
-                // this decl (mutual globs of the same item). Take that edge once.
-                if visited.insert(max_vis_decl) {
-                    self.update_decl_chain_inner(max_vis_decl, parent_id, visited);
-                }
+            // `vis()` is the most visible glob, so that glob's chain must be
+            // marked too. `ambiguity_vis_max` can cycle; follow it once.
+            if let Some(max) = decl.ambiguity_vis_max.get()
+                && seen_max.insert(max)
+            {
+                self.update_decl_chain(max, parent_id, seen_max);
             }
             parent_id = ParentId::Import(decl);
             decl = source_decl;
